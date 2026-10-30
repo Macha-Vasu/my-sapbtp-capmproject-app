@@ -1,0 +1,329 @@
+_schema-version: 3.3.0
+ID: employee-management
+version: 1.0.0
+description: "A simple CAP project."
+parameters:
+  enable-parallel-deployments: true
+  deploy_mode: html5-repo
+build-parameters:
+  before-all:
+    - builder: custom
+      commands:
+        - npm ci
+        - npx cds build --production
+modules:
+  - name: employee-management-srv
+    type: nodejs
+    path: gen/srv
+    parameters:
+      instances: 1
+      buildpack: nodejs_buildpack
+    build-parameters:
+      builder: npm-ci
+    provides:
+      - name: srv-api # required by consumers of CAP services (e.g. approuter)
+        properties:
+          srv-url: ${default-url}
+    requires:
+      - name: employee-management-auth
+      - name: employee-management-db
+      - name: employee-management-redis
+      - name: employee-management-messaging
+      - name: employee-management-kafka
+      - name: employee-management-connectivity
+      - name: employee-management-destination
+      - name: employee-management-logging
+      - name: employee-management-auditlog
+
+  - name: employee-management-mtx
+    type: nodejs
+    path: gen/mtx/sidecar
+    requires:
+      - name: employee-management-auth
+      - name: employee-management-db
+      - name: employee-management-registry
+      - name: app-api
+        properties:
+          SUBSCRIPTION_URL: ~{app-protocol}://\${tenant_subdomain}-~{app-uri}
+      - name: employee-management-destination
+      - name: employee-management-html5-runtime
+      - name: employee-management-html5-repo-host
+      - name: employee-management-portal
+      - name: employee-management-logging
+    build-parameters:
+      builder: npm-ci
+    parameters:
+      instances: 1
+      memory: 256M
+      disk-quota: 512M
+    hooks:
+      - name: upgrade-all
+        type: task
+        phases:
+          - blue-green.application.before-start.idle
+          - deploy.application.before-start
+        parameters:
+          name: upgrade
+          memory: 512M # increase as required
+          disk-quota: 768M # increase as required
+          command: cds-mtx upgrade '*'
+    provides:
+      - name: mtx-api
+        properties:
+          mtx-url: ${default-url}
+  - name: employee-management
+    type: approuter.nodejs
+    path: .deploy/app-router
+    parameters:
+      keep-existing-routes: true
+      disk-quota: 256M
+      memory: 256M
+    properties:
+      TENANT_HOST_PATTERN: "^(.*)-${default-uri}"
+    requires:
+      - name: srv-api
+        group: destinations
+        properties:
+          name: srv-api # must be used in xs-app.json as well
+          url: ~{srv-url}
+          forwardAuthToken: true
+      - name: mtx-api
+        group: destinations
+        properties:
+          name: mtx-api # must be used in xs-app.json as well
+          url: ~{mtx-url}
+      - name: employee-management-auth
+      - name: employee-management-destination
+      - name: employee-management-html5-runtime
+      - name: employee-management-portal
+      - name: employee-management-logging
+    provides:
+      - name: app-api
+        properties:
+          app-protocol: ${protocol}
+          app-uri: ${default-uri}
+
+  - name: employee-management-app-deployer
+    type: com.sap.application.content
+    path: gen
+    build-parameters:
+      build-result: app/
+      requires:
+        - name: employeemanagementadminauthors
+          artifacts:
+            - admin-authors.zip
+          target-path: app/
+        - name: employeemanagementadminbooks
+          artifacts:
+            - admin-books.zip
+          target-path: app/
+        - name: employeemanagementbrowse
+          artifacts:
+            - browse.zip
+          target-path: app/
+        - name: employeemanagementgenres
+          artifacts:
+            - genres.zip
+          target-path: app/
+    requires:
+      - name: employee-management-auth
+      - name: srv-api
+      - name: employee-management-html5-repo-host
+        parameters:
+          content-target: true
+          config:
+            HTML5Runtime_enabled: true
+
+  - name: employeemanagementadminauthors
+    type: html5
+    path: app/admin-authors
+    build-parameters:
+      build-result: dist
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build
+      supported-platforms:
+        []
+  - name: employeemanagementadminbooks
+    type: html5
+    path: app/admin-books
+    build-parameters:
+      build-result: dist
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build
+      supported-platforms:
+        []
+  - name: employeemanagementbrowse
+    type: html5
+    path: app/browse
+    build-parameters:
+      build-result: dist
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build
+      supported-platforms:
+        []
+  - name: employeemanagementgenres
+    type: html5
+    path: app/genres
+    build-parameters:
+      build-result: dist
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build
+      supported-platforms:
+        []
+
+  - name: employee-management-portal-deployer
+    type: com.sap.application.content
+    path: app/portal
+    parameters:
+      config:
+        TENANT_HOST_PATTERN: "^(.*)-${default-uri}"
+    requires:
+      - name: employee-management-portal
+        parameters:
+          content-target: true
+          service-key:
+            name: employee-management-portal-key
+            config:
+              content-endpoint: developer
+      - name: employee-management-auth
+      - name: employee-management-html5-repo-host
+      - name: employee-management-app-deployer
+    deployed-after:
+      - employee-management-app-deployer
+  - name: notification-content-deployment
+    type: nodejs
+    path: gen/srv
+    parameters:
+      no-route: true
+      no-start: true
+      memory: 256MB
+      disk-quota: 1GB
+      tasks:
+        - name: notification-content-deployment
+          command: "node node_modules/@cap-js/notifications/lib/content-deployment.js"
+          memory: 256MB
+          disk-quota: 1GB
+    requires:
+      - name: employee-management-destination
+
+resources:
+  - name: employee-management-auth
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+      config:
+        xsappname: employee-management-${org}-${space}
+        tenant-mode: shared
+        oauth2-configuration:
+          credential-types:
+            - "binding-secret"
+            - "x509"
+          redirect-uris:
+            - https://*~{app-api/app-uri}/**
+        role-collections:
+          - name: 'admin (employee-management ${org}-${space})'
+            description: 'generated'
+            role-template-references:
+              - '$XSAPPNAME.admin'
+    requires:
+      - name: app-api
+    processed-after:
+      - employee-management-messaging
+  - name: employee-management-db
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: service-manager
+      service-plan: container
+  - name: employee-management-redis
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: redis-cache
+      service-plan: standard
+      # config:
+      # memory: 2 # GB, can be 2 or 4
+      # multi_az: true
+      # cluster_mode: true
+      # shard_count: 1
+      # node_count: 3 # per shard minimum is 3 (for standard plan)
+      # engine_version: "6.0" # can be "4.0" or "6.0"
+      # maintenance_window:
+      # day_of_week: Friday
+      # start_hour_utc: 0
+      # duration: 5 # hours
+  - name: employee-management-registry
+    type: org.cloudfoundry.managed-service
+    requires:
+      - name: mtx-api
+    parameters:
+      service: saas-registry
+      service-plan: application
+      config:
+        xsappname: employee-management-${org}-${space}
+        appName: employee-management-${org}-${space}
+        displayName: employee-management
+        description: A simple CAP project.
+        category: 'Category'
+        appUrls:
+          getDependencies: ~{mtx-api/mtx-url}/-/cds/saas-provisioning/dependencies
+          onSubscription: ~{mtx-api/mtx-url}/-/cds/saas-provisioning/tenant/{tenantId}
+          onSubscriptionAsync: true
+          onUnSubscriptionAsync: true
+          onUpdateDependenciesAsync: true
+          callbackTimeoutMillis: 300000 # Increase if your deployments are taking longer than that
+  - name: employee-management-messaging
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: enterprise-messaging
+      service-plan: default
+      path: ./event-mesh.json
+  - name: employee-management-kafka
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: kafka
+      service-plan: standard
+  - name: employee-management-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite
+  - name: employee-management-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+
+  - name: employee-management-html5-repo-host
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: html5-apps-repo
+      service-plan: app-host
+  - name: employee-management-html5-runtime
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: html5-apps-repo
+      service-plan: app-runtime
+  - name: employee-management-portal
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: portal
+      service-plan: standard
+  - name: employee-management-logging
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: application-logs
+      service-plan: standard
+  - name: employee-management-auditlog
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: auditlog
+      service-plan: premium
